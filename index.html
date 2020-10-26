@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang=en-gb class=newslabs-bootstrap>
+    <head>
+        <meta charset=utf-8>
+        <meta name=application-name content="News Labs Audio Extractor">
+        <script src=https://bbc.github.io/newslabs-elements/bbc-newslabs-header.js></script>
+        <script src=https://bbc.github.io/newslabs-elements/bbc-newslabs-footer.js></script>
+    </head>
+    <body>
+<bbc-newslabs-header subtitle="In-browser audio extractor and pcm encoder"></bbc-newslabs-header>
+<bbc-newslabs-footer email=dave.bevan@bbc.co.uk></bbc-newslabs-footer>
+<main class=container>
+    <div class=jumbotron>
+        <h4 style=color:var(--nl-red)>Audio-for-transcription extraction in the browser</h4>
+        <br>
+        <li>Extract audio from any browser-supported video or audio file</li>
+        <li>Resample audio to 1 channel, 16k samples/second</li>
+        <li>Save as a pcm_u8 wav which is suitable for processing by speech to text systems</li>
+    </div>
+    <div>
+        <button class="btn btn-primary" onclick=document.querySelector('input').click()>Choose file
+        <input type=file accept="audio/*,video/*" onchange=AFT.go() style=display:none>
+        </button>
+        <span id=selectedFilename></span>
+        <hr>
+        <div id=step></div>
+        <progress value=0 style=width:100%>
+    </div>
+</main>
+</body>
+
+<script>
+var AFT=AFT || {}
+AFT.go = function() {
+    // Influenced by https://jsfiddle.net/8w5xs9o5/23/
+    const f = document.querySelector('input[type=file]')
+    const progress = document.querySelector('progress')
+    const step = document.querySelector('#step')
+
+    const tStart = new Date().getTime()
+    console.time('elapsed_1')
+
+    progress.min = progress.value = 0
+
+    if (f.files.length<1) return
+
+    var srcfile = f.files[0]
+
+    const srcMB = (srcfile.size / 1024 / 1024).toFixed(2)
+    const srcMBstr = " (" + srcMB + " MB)"
+
+    document.querySelector('#selectedFilename').innerHTML = srcfile.name + srcMBstr
+
+    step.innerHTML='Reading ' + srcfile.name + srcMBstr
+
+    progress.max = f.files[0].size
+
+    var audioContext = new (window.AudioContext || window.webkitAudioContext)()
+    var reader = new FileReader()
+    var mybuffer
+    var duration
+
+    const sampleRate = 16000
+    const numChannels = 1
+
+    reader.onprogress = function(event) {
+        progress.value = event.loaded
+    }
+
+    // build the audio extraction chain
+    reader.onload = function (e) {
+
+        progress.removeAttribute('value')
+
+        step.innerHTML = 'Extracting audio from ' + srcfile.name + srcMBstr
+
+        // extract the audio from the supplied array buffer
+        audioContext
+            .decodeAudioData(e.target.result)
+            .then(audioSamples => {
+                duration = audioSamples.duration
+                step.innerHTML = 'Converting audio (clip duration: ' + duration.toFixed(2) + ' s)'
+                console.log('audioSamples', audioSamples)
+                var offlineAudioContext = new OfflineAudioContext(numChannels, sampleRate * duration, sampleRate)
+                var audioSource = offlineAudioContext.createBufferSource()
+                mybuffer = audioSamples
+                audioSource.buffer = mybuffer
+                audioSource.connect(offlineAudioContext.destination)
+                audioSource.start()
+                offlineAudioContext
+                    .startRendering()
+                    .then(resampledAudio => {
+                        console.log('Finished resampling the original file.', resampledAudio)
+
+                        progress.value=0
+
+                        AFT.saveAsWav(resampledAudio)
+
+                        const uploadMB = (resampledAudio.length/1024/1024).toFixed(2)
+                        const perc = ((uploadMB / srcMB) * 100).toFixed(2)
+                        const tEnd = new Date().getTime()
+
+                        step.innerHTML = 'All done in ' + ((tEnd - tStart)/1000).toFixed(1) + ' seconds.'
+                            + '<br>'
+                            + 'Encoded audio to upload is ' + uploadMB + ' MB (' + perc + '% of the source file)'
+                            + '<br>'
+                            + 'Duration: ' + duration.toFixed(2) + ' seconds'
+
+                        console.timeEnd('elapsed_1')
+                    })
+                    .catch(err => {
+                        console.log('Resampling failed: ', err)
+                    })
+
+            })
+    }
+
+    // feed the chain with the input media file
+    reader.readAsArrayBuffer(srcfile)
+}
+
+AFT.saveAsWav = function(resampledAudio) {
+    // Influenced by https://github.com/Jam3/audiobuffer-to-wav/blob/master/index.js
+    console.log('saveAsWav', resampledAudio)
+
+    var buffer = new ArrayBuffer(44 + resampledAudio.length)
+    var view = new DataView(buffer)
+
+    const bytesPerSample = 1
+
+    function writeString(view, offset, string) {
+        for (var i = 0; i < string.length; i++ ) {
+            view.setUint8(offset + i, string.charCodeAt(i))
+        }
+    }
+
+    // RIFF
+    writeString(view, 0, 'RIFF')
+
+    // RIFF chunk length
+    var len=36 + resampledAudio.length * bytesPerSample
+    console.log('RIFF chunk length = ' + len)
+    view.setUint32(4, len, true)
+
+    // RIFF type & format chunk label
+    writeString(view, 8, 'WAVEfmt ')
+
+    // format chunk length
+    view.setUint32(16, 16, true)
+
+    // format (int==1, float32==3)
+    view.setUint16(20, 1, true)
+
+    // channel count
+    view.setUint16(22, resampledAudio.numberOfChannels, true)
+
+    // sample rate
+    view.setUint32(24, resampledAudio.sampleRate, true)
+
+    // byte rate
+    view.setUint32(28, resampledAudio.sampleRate * resampledAudio.numberOfChannels * bytesPerSample, true)
+
+    // block align
+    view.setUint16(32, resampledAudio.numberOfChannels * bytesPerSample, true)
+
+    // bits / sample
+    view.setUint16(34, bytesPerSample * 8, true)
+
+    // data chunk label
+    writeString(view, 36, 'data')
+
+    // data chunk length
+    view.setUint32(40, resampledAudio.length * bytesPerSample, true)
+
+    // encode our audio as pcm_u8
+    const samples = resampledAudio.getChannelData(0)
+    console.time('pcm_u8_encoder')
+    for (var i = 0, offset = 44; i < resampledAudio.length; i++, offset++) {
+        // encode as pcm_u8 - rescale sample (float -1 to 1) to unsigned int
+        view.setUint8(offset, (samples[i] * 0x7f) + 0x7f, true)
+    }
+    console.timeEnd('pcm_u8_encoder')
+
+    const downloadURL = (data, fileName) => {
+        const a = document.createElement('a')
+        a.href = data
+        a.download = fileName
+        a.style.display = 'none'
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+    }
+
+    const blob = new Blob([buffer], {
+        type: 'application/octet-stream',
+    })
+
+    const url = window.URL.createObjectURL(blob)
+
+    downloadURL(url, 'resampledAudio.wav')
+
+    setTimeout(()=>{
+        window.URL.revokeObjectURL(url)
+    }, 1000)
+}
+</script>
+
+</html>
